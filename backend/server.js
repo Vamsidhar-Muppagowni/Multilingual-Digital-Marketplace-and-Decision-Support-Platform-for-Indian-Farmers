@@ -1,284 +1,129 @@
-const express = require("express");
-const cors = require("cors");
-const bcrypt = require("bcrypt");
-const db = require("./db"); // MySQL Connection
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const dotenv = require('dotenv');
+const { createServer } = require('http');
+const { Server } = require('socket.io');
+const rateLimit = require('express-rate-limit'); // Changed from rate-limiter-flexible for simplicity in setup
+const fs = require('fs');
+
+// Load environment variables
+dotenv.config();
 
 const app = express();
+const httpServer = createServer(app);
 
-// middleware
+// Initialize DB and Redis with fallback logic
+let sequelize = require('./config/database');
+const redisClient = require('./config/redis');
+
+// Middleware imports
+const authMiddleware = require('./middleware/auth');
+const errorHandler = require('./middleware/errorHandler');
+
+// Setup Socket.IO
+const io = new Server(httpServer, {
+    cors: {
+        origin: process.env.FRONTEND_URL || '*',
+        credentials: true
+    }
+});
+
+io.on('connection', (socket) => {
+    console.log('New client connected:', socket.id);
+    socket.on('joinRoom', (room) => socket.join(room));
+    socket.on('disconnect', () => console.log('Client disconnected:', socket.id));
+});
+
+// Global middleware
+app.use(helmet());
+app.use(cors({
+    origin: process.env.FRONTEND_URL || '*',
+    credentials: true
+}));
 app.use(express.json());
-app.use(cors());
+app.use(express.urlencoded({ extended: true }));
 
-app.use((req, res, next) => {
-    console.log(`[REQUEST] ${req.method} ${req.url}`);
-    next();
+// Rate limiting
+const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 100
+});
+app.use('/api/', limiter);
+
+app.use('/uploads', express.static('uploads'));
+
+// Routes
+// We require routes AFTER db initialization might change? No, models require sequelize instance.
+// If we switch to SQLite, models need to use that instance.
+// models/index.js imports config/database.js, so it shares the instance.
+
+app.use('/api/auth', require('./routes/auth'));
+app.use('/api/farmer', authMiddleware.authMiddleware, require('./routes/farmer'));
+app.use('/api/buyer', authMiddleware.authMiddleware, require('./routes/buyer'));
+app.use('/api/market', authMiddleware.authMiddleware, require('./routes/market'));
+app.use('/api/ml', authMiddleware.authMiddleware, require('./routes/ml'));
+app.use('/api/government', authMiddleware.authMiddleware, require('./routes/government'));
+app.use('/api/logistics', authMiddleware.authMiddleware, require('./routes/logistics'));
+
+app.get('/health', (req, res) => {
+    res.status(200).json({ status: 'OK' });
 });
 
-// Debug Middleware: Log all requests
-app.use((req, res, next) => {
-    console.log(`[REQUEST] ${req.method} ${req.url}`);
-    console.log('Body:', req.body);
-    next();
-});
+app.use(errorHandler);
 
-// ----- Auth Routes -----
+const PORT = process.env.PORT || 5000;
 
-// Email Configuration
-const nodemailer = require('nodemailer');
-const transporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: {
-        user: 'vamsimuppagowni@gmail.com', // User provided
-        pass: 'tntn nqbe qdpv sgdr'        // User provided App Password
-    }
-});
-
-// Temporary OTP Store (In-memory)
-const otpStore = new Map(); // email -> { otp, expires }
-
-app.post("/api/auth/forgot-password", async (req, res) => {
-    const { email } = req.body;
+const startServer = async () => {
     try {
-        const [users] = await db.query("SELECT * FROM users WHERE email = ?", [email]);
-        if (users.length === 0) {
-            return res.status(404).json({ message: "User not found" });
-        }
+        // 1. Try Redis
+        await redisClient.connect();
+        // (Redis config now handles fallback to mock internally if connect fails)
 
-        // Generate 6-digit OTP
-        const otp = Math.floor(100000 + Math.random() * 900000).toString();
-
-        // Store OTP (valid for 10 mins)
-        otpStore.set(email, { otp, expires: Date.now() + 10 * 60 * 1000 });
-
-        // Send Email
-        const mailOptions = {
-            from: 'vamsimuppagowni@gmail.com',
-            to: email,
-            subject: 'Password Reset OTP - M-5 Farming',
-            text: `Your OTP for password reset is: ${otp}. It is valid for 10 minutes.`
-        };
-
-        transporter.sendMail(mailOptions, (error, info) => {
-            if (error) {
-                console.error("Email send error:", error);
-                return res.status(500).json({ message: "Failed to send email" });
+        // 2. Database Connection
+        try {
+            await sequelize.authenticate();
+            console.log(`✅ Database connected (${sequelize.options.dialect})`);
+        } catch (dbError) {
+            console.error('❌ Database Connection Failed:', dbError.message);
+            if (sequelize.options.dialect !== 'sqlite') {
+                console.error('   If you do not have PostgreSQL installed, set USE_SQLITE=true in your .env file or environment variables.');
             }
-            console.log('Email sent: ' + info.response);
-            res.json({ message: "OTP sent successfully" });
+            process.exit(1);
+        }
+
+        // Sync models
+        if (process.env.NODE_ENV !== 'production') {
+            // Workaround for SQLite alter table limitations
+            if (sequelize.options.dialect === 'sqlite') {
+                await sequelize.query('PRAGMA foreign_keys = OFF;');
+            }
+
+            try {
+                await sequelize.sync({ alter: true });
+                console.log('✅ Database synced');
+            } catch (syncError) {
+                console.error('❌ Database Sync Failed:', syncError.message);
+                if (sequelize.options.dialect === 'sqlite') {
+                    console.warn('   Note: SQLite has limitations with ALTER TABLE. You might need to delete database.sqlite to reset schema if development changes are incompatible.');
+                }
+            }
+
+            if (sequelize.options.dialect === 'sqlite') {
+                await sequelize.query('PRAGMA foreign_keys = ON;');
+            }
+        }
+
+        httpServer.listen(PORT, () => {
+            console.log(`🚀 Server running on port ${PORT}`);
         });
 
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ message: "Server error" });
+    } catch (error) {
+        console.error('❌ Server startup failed:', error);
+        process.exit(1);
     }
-});
+};
 
-app.post("/api/auth/reset-password", async (req, res) => {
-    const { email, otp, newPassword } = req.body;
+startServer();
 
-    const record = otpStore.get(email);
-    if (!record) {
-        return res.status(400).json({ message: "Invalid or expired OTP" });
-    }
-
-    if (record.otp !== otp) {
-        return res.status(400).json({ message: "Incorrect OTP" });
-    }
-
-    if (Date.now() > record.expires) {
-        otpStore.delete(email);
-        return res.status(400).json({ message: "OTP expired" });
-    }
-
-    try {
-        const hashedPassword = await bcrypt.hash(newPassword, 10);
-        await db.query("UPDATE users SET password = ? WHERE email = ?", [hashedPassword, email]);
-
-        otpStore.delete(email); // Clear OTP
-        res.json({ message: "Password reset successfully" });
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ message: "Server error" });
-    }
-});
-
-app.post("/api/auth/verify-otp", (req, res) => {
-    const { email, otp } = req.body;
-
-    const record = otpStore.get(email);
-    if (!record) {
-        return res.status(400).json({ message: "Invalid or expired OTP" });
-    }
-
-    if (record.otp !== otp) {
-        return res.status(400).json({ message: "Incorrect OTP" });
-    }
-
-    if (Date.now() > record.expires) {
-        otpStore.delete(email);
-        return res.status(400).json({ message: "OTP expired" });
-    }
-
-    res.json({ message: "OTP verified successfully" });
-});
-
-app.post("/api/register", async (req, res) => {
-    const { name, email, password, role } = req.body;
-    try {
-        // Check if user exists
-        const [existing] = await db.query("SELECT * FROM users WHERE email = ?", [email]);
-        if (existing.length > 0) {
-            return res.status(400).json({ message: "User already exists" });
-        }
-
-        // Insert new user
-        // Hash password
-        const hashedPassword = await bcrypt.hash(password, 10);
-        await db.query("INSERT INTO users (name, email, password, role) VALUES (?, ?, ?, ?)", [
-            name, email, hashedPassword, role
-        ]);
-
-        res.status(201).json({ message: "User registered successfully" });
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ message: "Server error" });
-    }
-});
-
-app.post("/api/login", async (req, res) => {
-    const { email, password, role } = req.body; // Role optional in check if we just check email/pass
-    try {
-        const [users] = await db.query("SELECT * FROM users WHERE email = ?", [email]);
-
-        if (users.length === 0) {
-            return res.status(401).json({ message: "Invalid email or password" });
-        }
-
-        const user = users[0];
-
-        // Check password
-        const isMatch = await bcrypt.compare(password, user.password);
-        if (!isMatch) {
-            return res.status(401).json({ message: "Invalid email or password" });
-        }
-
-        // Optional: specific role check?
-        // if (role && user.role !== role) ... 
-
-        res.json({
-            message: "Login successful",
-            user: { id: user.id, name: user.name, email: user.email, role: user.role }
-        });
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ message: "Server error" });
-    }
-});
-
-// ----- Temporary in-memory data (Phase-1) -----
-
-let schemes = [
-    {
-        id: 1,
-        name: "PM-KISAN",
-        eligibility: "Small and marginal farmers",
-        benefit: "₹6000 per year"
-    },
-    {
-        id: 2,
-        name: "Crop Insurance Scheme",
-        eligibility: "All registered farmers",
-        benefit: "Insurance against crop loss"
-    }
-];
-
-let payments = [
-    {
-        farmerId: 101, // Mock farmer ID
-        amount: 12000,
-        status: "Paid",
-        date: "2024-03-12"
-    },
-    {
-        farmerId: 101,
-        amount: 4500,
-        status: "Received",
-        date: "2024-01-15"
-    }
-];
-
-let tips = [
-    {
-        id: 1,
-        month: "June",
-        type: "Tip",
-        message: "Ensure proper irrigation during early monsoon"
-    },
-    {
-        id: 2,
-        month: "July",
-        type: "Warning",
-        message: "Watch out for pest attacks due to excess humidity"
-    },
-    {
-        id: 3,
-        month: "November",
-        type: "Tip",
-        message: "Best time to sow wheat is Nov 1st to Nov 15th."
-    }
-];
-
-// test route
-app.get("/api/schemes", (req, res) => {
-    res.json(schemes);
-});
-
-app.get("/api/payments/:farmerId", (req, res) => {
-    const farmerId = req.params.farmerId;
-    const farmerPayments = payments.filter(
-        payment => payment.farmerId == farmerId
-    );
-    res.json(farmerPayments);
-});
-
-app.get("/api/tips", (req, res) => {
-    res.json(tips);
-});
-
-// ----- SMS Simulation Routes -----
-
-// 1. Receive SMS from Farmer (e.g. "PRICE RICE")
-app.post("/api/sms/receive", (req, res) => {
-    const { from, message } = req.body;
-    console.log(`[SMS-GATEWAY] Inbound SMS from ${from}: "${message}"`);
-
-    let reply = "Invalid Command. Try: PRICE <CROP_NAME>";
-    const cleanMsg = message.trim().toUpperCase();
-
-    if (cleanMsg.startsWith("PRICE")) {
-        const crop = cleanMsg.split(" ")[1];
-        if (crop) {
-            // Mock price lookup logic
-            const price = Math.floor(Math.random() * (5000 - 1000 + 1)) + 1000;
-            reply = `Mandi Prices: ${crop} is currently trading at ₹${price}/quintal in your area.`;
-        }
-    } else if (cleanMsg === "HELP") {
-        reply = "Commands: PRICE <CROP>, STATUS <ORDER_ID>, WEATHER";
-    }
-
-    console.log(`[SMS-GATEWAY] Auto-Reply to ${from}: "${reply}"`);
-    res.json({ status: "success", reply });
-});
-
-// 2. Send SMS to Farmer (Trade Updates, Reminders)
-app.post("/api/sms/send", (req, res) => {
-    const { to, message } = req.body;
-    console.log(`[SMS-GATEWAY] Outbound SMS to ${to}: "${message}"`);
-    res.json({ status: "success", message: "SMS Queued" });
-});
-
-// start server
-const PORT = 5000;
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-});
+module.exports = { app, io };
